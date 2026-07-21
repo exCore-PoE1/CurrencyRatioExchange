@@ -23,12 +23,23 @@ namespace CurrencyRatioExchange
         private int _calculatedHave = 0;
         private string _errorMessage = "";
         private bool _hasValidResult = false;
-        private bool _isProcessing = false;
+        private volatile bool _isProcessing = false;
         private bool _calculateExactWantedAmount = false;
+
+        // Fill status feedback (written from the fill task, read on the render thread)
+        private volatile string _statusMessage = "";
+        private volatile bool _statusOk = true;
 
         // For quick-fill from competing trades
         private int _quickFillWant = 0;
         private int _quickFillHave = 0;
+
+        private const int ClickFocusDelayMs = 100;
+        private const int ClearBackspaces = 10;
+        private const int VerifyTimeoutMs = 600;
+        private const int VerifyPollMs = 30;
+        private const int CursorDriftThresholdSq = 100;
+        private const string PlaceOrderLabelText = "place order";
 
         public override bool Initialise()
         {
@@ -179,7 +190,7 @@ namespace CurrencyRatioExchange
                             {
                                 try
                                 {
-                                    await PerformFill();
+                                    await FillExchange(_calculatedWant, _calculatedHave);
                                 }
                                 finally
                                 {
@@ -195,6 +206,8 @@ namespace CurrencyRatioExchange
                     ImGui.TextWrapped($"Error: {_errorMessage}");
                     ImGui.PopStyleColor();
                 }
+
+                RenderFillStatus();
 
                 ImGui.Spacing();
                 ImGui.Separator();
@@ -413,7 +426,7 @@ namespace CurrencyRatioExchange
                 {
                     try
                     {
-                        await PerformFillValues(want, have);
+                        await FillExchange(want, have);
                     }
                     finally
                     {
@@ -569,75 +582,309 @@ namespace CurrencyRatioExchange
             _quickFillHave = have;
         }
 
-        private async Task PerformFillValues(int wantValue, int haveValue)
+        // Shared hardened fill path for calculator and competing-trade actions.
+        private async Task FillExchange(int wantValue, int haveValue)
         {
+            if (wantValue <= 0 || haveValue <= 0)
+                return;
+
             var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
             if (currencyPanel == null || !currencyPanel.IsVisible)
+            {
+                SetStatus("Currency Exchange panel is not open", false);
                 return;
+            }
 
             var wantedInput = currencyPanel.WantedItemCountInput;
             var offeredInput = currencyPanel.OfferedItemCountInput;
-
             if (wantedInput == null || offeredInput == null)
             {
+                SetStatus("Input fields not found", false);
                 LogMessage("Cannot fill: Input fields not found");
                 return;
             }
 
+            var windowOffsetSharp = GameController.Window.GetWindowRectangleTimeCache.TopLeft;
+            var windowOffset = new Vector2(windowOffsetSharp.X, windowOffsetSharp.Y);
+            var offsets = new Vector2(Settings.ClickXOffset.Value, Settings.ClickYOffset.Value);
+            var cursorBefore = Mouse.GetCursorPosition();
+            bool aborted = false;
+            bool placeReady = false;
+
             try
             {
-                var windowOffsetSharp = GameController.Window.GetWindowRectangleTimeCache.TopLeft;
-                var windowOffset = new Vector2(windowOffsetSharp.X, windowOffsetSharp.Y);
-                var xOffset = Settings.ClickXOffset.Value;
-                var yOffset = Settings.ClickYOffset.Value;
+                SetStatus("Filling...", true);
 
-                // Fill the "I Want" field
-                var wantCenter = wantedInput.GetClientRectCache.Center;
-                var wantPos = new Vector2(wantCenter.X, wantCenter.Y) + windowOffset + new Vector2(xOffset, yOffset);
+                bool wantOk = await FillField(wantedInput, wantValue, windowOffset, offsets);
+                bool haveOk = await FillField(offeredInput, haveValue, windowOffset, offsets);
+                placeReady = !Settings.VerifyFills.Value || (wantOk && haveOk);
 
-                await Mouse.MoveMouse(wantPos);
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                for (int i = 0; i < 8; i++)
+                if (!Settings.VerifyFills.Value)
                 {
-                    await Keyboard.KeyPress(Keys.Back);
+                    SetStatus($"Filled (unverified): {wantValue} : {haveValue}", true);
+                }
+                else if (wantOk && haveOk)
+                {
+                    SetStatus($"Filled OK: {wantValue} : {haveValue}", true);
+                }
+                else
+                {
+                    string which =
+                        (!wantOk ? "Want" : "")
+                        + (!wantOk && !haveOk ? " & " : "")
+                        + (!haveOk ? "Have" : "");
+                    SetStatus($"Could not verify {which} - check the fields and retry", false);
                 }
 
-                await Keyboard.Type(wantValue.ToString());
-                await Task.Delay(150);
-
-                // Fill the "I Have" field
-                var haveCenter = offeredInput.GetClientRectCache.Center;
-                var havePos = new Vector2(haveCenter.X, haveCenter.Y) + windowOffset + new Vector2(xOffset, yOffset);
-
-                await Mouse.MoveMouse(havePos);
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                for (int i = 0; i < 8; i++)
-                {
-                    await Keyboard.KeyPress(Keys.Back);
-                }
-
-                await Keyboard.Type(haveValue.ToString());
-
-                LogMessage($"Filled: Want {wantValue} : Have {haveValue}");
+                LogMessage(
+                    $"Fill want={wantValue} have={haveValue} wantOk={wantOk} haveOk={haveOk}"
+                );
+            }
+            catch (FillAbortedException ex)
+            {
+                aborted = true;
+                SetStatus($"Fill cancelled ({ex.Message})", false);
             }
             catch (Exception ex)
             {
+                SetStatus($"Error: {ex.Message}", false);
                 LogError($"Error during fill: {ex.Message}");
             }
+            finally
+            {
+                if (aborted)
+                {
+                    // Leave the cursor under the user's control after a cancellation.
+                }
+                else if (placeReady && Settings.MoveCursorToPlaceOrder.Value)
+                {
+                    if (
+                        TryGetPlaceOrderButtonPos(
+                            currencyPanel,
+                            windowOffset,
+                            offsets,
+                            out var placePos
+                        )
+                    )
+                    {
+                        Mouse.SetPosition(placePos);
+                    }
+                    else
+                    {
+                        Mouse.SetPosition(new Vector2(cursorBefore.X, cursorBefore.Y));
+                        if (Settings.ShowDebugInfo.Value)
+                            LogMessage("Place Order button not found; cursor restored.");
+                    }
+                }
+                else
+                {
+                    Mouse.SetPosition(new Vector2(cursorBefore.X, cursorBefore.Y));
+                }
+            }
+        }
+
+        private bool TryGetPlaceOrderButtonPos(
+            ExileCore.PoEMemory.Element panel,
+            Vector2 windowOffset,
+            Vector2 offsets,
+            out Vector2 pos
+        )
+        {
+            pos = default;
+
+            try
+            {
+                var label = FindPlaceOrderLabel(panel) ?? FindPlaceOrderLabel(panel?.Root);
+                var button = label?.Parent ?? label;
+                if (button == null || !button.IsValid || !button.IsVisible)
+                    return false;
+
+                var rect = button.GetClientRectCache;
+                if (rect.Width <= 1 || rect.Height <= 1)
+                    return false;
+
+                var center = rect.Center;
+                pos = new Vector2(center.X, center.Y) + windowOffset + offsets;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static ExileCore.PoEMemory.Element FindPlaceOrderLabel(
+            ExileCore.PoEMemory.Element root
+        )
+        {
+            return root?.FindChildRecursive(e =>
+            {
+                var text = e?.TextNoTags;
+                if (string.IsNullOrEmpty(text))
+                    text = e?.Text;
+                return !string.IsNullOrEmpty(text)
+                    && text.Trim().Equals(PlaceOrderLabelText, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+
+        private async Task<bool> FillField(
+            ExileCore.PoEMemory.Element field,
+            int value,
+            Vector2 windowOffset,
+            Vector2 offsets
+        )
+        {
+            bool verify = Settings.VerifyFills.Value;
+            int maxAttempts = verify ? Math.Max(1, Settings.MaxFillRetries.Value) : 1;
+            string target = value.ToString();
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var center = field.GetClientRectCache.Center;
+                var pos = new Vector2(center.X, center.Y) + windowOffset + offsets;
+
+                await ClickAt(pos);
+                await Task.Delay(ClickFocusDelayMs);
+                EnsureCursorHeld(pos);
+                await ClickAt(pos);
+                await Task.Delay(ClickFocusDelayMs);
+                EnsureCursorHeld(pos);
+
+                for (int i = 0; i < ClearBackspaces; i++)
+                {
+                    EnsureCursorHeld(pos);
+                    await Keyboard.KeyPress(Keys.Back);
+                }
+
+                foreach (char character in target)
+                {
+                    EnsureCursorHeld(pos);
+                    await Keyboard.Type(character.ToString());
+                }
+                EnsureCursorHeld(pos);
+
+                if (!verify)
+                {
+                    await Task.Delay(150);
+                    return true;
+                }
+
+                if (await WaitForFieldValue(field, value, pos))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static async Task ClickAt(Vector2 pos)
+        {
+            await Mouse.MoveMouse(pos);
+            await Mouse.LeftDown();
+            await Mouse.LeftUp();
+        }
+
+        private async Task<bool> WaitForFieldValue(
+            ExileCore.PoEMemory.Element field,
+            int target,
+            Vector2 heldPos
+        )
+        {
+            int elapsed = 0;
+            while (elapsed < VerifyTimeoutMs)
+            {
+                EnsureCursorHeld(heldPos);
+
+                var read = ReadFieldNumber(field);
+                if (read.HasValue && read.Value == target)
+                    return true;
+
+                await Task.Delay(VerifyPollMs);
+                elapsed += VerifyPollMs;
+            }
+
+            return false;
+        }
+
+        private static int? ReadFieldNumber(ExileCore.PoEMemory.Element field)
+        {
+            if (field == null)
+                return null;
+
+            try
+            {
+                string raw = FirstNonEmpty(field.TextNoTags, field.Text);
+
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    var child = field.FindChildRecursive(e =>
+                    {
+                        var text = e?.Text;
+                        return !string.IsNullOrWhiteSpace(text) && text.Any(char.IsDigit);
+                    });
+                    if (child != null)
+                        raw = FirstNonEmpty(child.TextNoTags, child.Text);
+                }
+
+                if (string.IsNullOrWhiteSpace(raw))
+                    return null;
+
+                var digits = new string(raw.Where(char.IsDigit).ToArray());
+                return digits.Length > 0 && int.TryParse(digits, out int value)
+                    ? value
+                    : (int?)null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string FirstNonEmpty(string a, string b) =>
+            !string.IsNullOrWhiteSpace(a) ? a : b;
+
+        private void EnsureCursorHeld(Vector2 expected)
+        {
+            if (!Settings.AbortOnMouseMove.Value)
+                return;
+
+            var current = Mouse.GetCursorPosition();
+            int dx = current.X - (int)expected.X;
+            int dy = current.Y - (int)expected.Y;
+            if (dx * dx + dy * dy > CursorDriftThresholdSq)
+                throw new FillAbortedException("you moved the mouse");
+        }
+
+        private void RenderFillStatus()
+        {
+            if (_isProcessing)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1.0f, 0.85f, 0.2f, 1.0f));
+                ImGui.TextWrapped("Filling exchange window...");
+                ImGui.PopStyleColor();
+                return;
+            }
+
+            if (string.IsNullOrEmpty(_statusMessage))
+                return;
+
+            var color = _statusOk
+                ? new Vector4(0.2f, 1.0f, 0.2f, 1.0f)
+                : new Vector4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui.PushStyleColor(ImGuiCol.Text, color);
+            ImGui.TextWrapped(_statusMessage);
+            ImGui.PopStyleColor();
+        }
+
+        private void SetStatus(string message, bool ok)
+        {
+            _statusMessage = message;
+            _statusOk = ok;
+        }
+
+        private sealed class FillAbortedException : Exception
+        {
+            public FillAbortedException(string message)
+                : base(message) { }
         }
 
         private void Calculate()
@@ -788,84 +1035,5 @@ namespace CurrencyRatioExchange
             return (want: 0, have: 0);
         }
 
-        private async Task PerformFill()
-        {
-            var currencyPanel = GameController.IngameState?.IngameUi?.CurrencyExchangePanel;
-            if (currencyPanel == null || !currencyPanel.IsVisible)
-                return;
-
-            if (!_hasValidResult || _calculatedWant <= 0 || _calculatedHave <= 0)
-            {
-                return;
-            }
-
-            var wantedInput = currencyPanel.WantedItemCountInput;
-            var offeredInput = currencyPanel.OfferedItemCountInput;
-
-            if (wantedInput == null || offeredInput == null)
-            {
-                LogMessage("Cannot fill: Input fields not found");
-                return;
-            }
-
-            try
-            {
-                var windowOffsetSharp = GameController.Window.GetWindowRectangleTimeCache.TopLeft;
-                var windowOffset = new Vector2(windowOffsetSharp.X, windowOffsetSharp.Y);
-                var xOffset = Settings.ClickXOffset.Value;
-                var yOffset = Settings.ClickYOffset.Value;
-
-                // Fill the "I Want" field
-                var wantCenter = wantedInput.GetClientRectCache.Center;
-                var wantPos = new Vector2(wantCenter.X, wantCenter.Y) + windowOffset + new Vector2(xOffset, yOffset);
-
-                // Double-click to ensure focus (first click focuses game, second click focuses field)
-                await Mouse.MoveMouse(wantPos);
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                // Clear field
-                for (int i = 0; i < 8; i++)
-                {
-                    await Keyboard.KeyPress(Keys.Back);
-                }
-
-                await Keyboard.Type(_calculatedWant.ToString());
-                await Task.Delay(150);
-
-                // Fill the "I Have" field
-                var haveCenter = offeredInput.GetClientRectCache.Center;
-                var havePos = new Vector2(haveCenter.X, haveCenter.Y) + windowOffset + new Vector2(xOffset, yOffset);
-
-                // Double-click for this field too
-                await Mouse.MoveMouse(havePos);
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                await Mouse.LeftDown();
-                await Mouse.LeftUp();
-                await Task.Delay(100);
-
-                // Clear field
-                for (int i = 0; i < 8; i++)
-                {
-                    await Keyboard.KeyPress(Keys.Back);
-                }
-
-                await Keyboard.Type(_calculatedHave.ToString());
-
-                LogMessage($"Filled: Want {_calculatedWant} : Have {_calculatedHave}");
-            }
-            catch (Exception ex)
-            {
-                LogError($"Error during fill: {ex.Message}");
-            }
-        }
     }
 }

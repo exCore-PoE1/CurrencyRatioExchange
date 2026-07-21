@@ -34,6 +34,14 @@ namespace CurrencyRatioExchange.Utils
             return lpPoint;
         }
 
+        /// <summary>
+        /// Sets the cursor once without retrying, so restoring it never fights the user.
+        /// </summary>
+        public static void SetPosition(Vector2 pos)
+        {
+            SetCursorPos((int)pos.X, (int)pos.Y);
+        }
+
         public static async Task MoveMouse(Vector2 pos)
         {
             Vector2i currentPos;
