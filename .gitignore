@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+.idea/
+.claude/
+CLAUDE.md
+Errors.txt
+*.user
+*.suo
+*.DotSettings.user
+
