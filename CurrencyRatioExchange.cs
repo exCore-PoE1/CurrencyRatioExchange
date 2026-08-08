@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Linq;
 using System.Numerics;
 using System.Reflection;
@@ -10,6 +9,7 @@ using CurrencyRatioExchange.Utils;
 using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.Elements;
+using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using ImGuiNET;
 
@@ -275,28 +275,34 @@ namespace CurrencyRatioExchange
                 if (stock == null)
                     continue;
 
-                // Keep as doubles to preserve ratio precision
-                double get = stock.Get;
-                double give = stock.Give;
+                int get = stock.Get;
+                int give = stock.Give;
                 int listed = (int)stock.ListedCount;
 
                 if (get <= 0 || give <= 0)
+                    continue;
+
+                if (
+                    !RatioMath.TryCreateCompetingOrder(
+                        get,
+                        give,
+                        out TradeRatio competingRatio
+                    )
+                )
                     continue;
 
                 // Display ratio matching in-game format
                 // In-game always displays the ratio with the larger value first (X:1 or 1:X where X >= 1)
                 // The stock's Get/Give values represent the raw trade amounts
                 string ratioDisplay;
-                if (give >= get)
+                if (competingRatio.Want >= competingRatio.Have)
                 {
-                    // give/get >= 1, display as X:1 (e.g., 2.20:1)
-                    double ratioValue = give / get;
+                    double ratioValue = (double)competingRatio.Want / competingRatio.Have;
                     ratioDisplay = $"{ratioValue:F2}:1";
                 }
                 else
                 {
-                    // get/give > 1, display as 1:X (e.g., 1:1.33)
-                    double ratioValue = get / give;
+                    double ratioValue = (double)competingRatio.Have / competingRatio.Want;
                     ratioDisplay = $"1:{ratioValue:F2}";
                 }
 
@@ -308,19 +314,12 @@ namespace CurrencyRatioExchange
                 // Quick fill buttons
                 ImGui.PushID(index);
 
-                // Calculate actual fill amounts.
-                // - give = what we want to receive
-                // - get = what we have to offer
                 bool hasWantedAmount = TryGetWantedAmountInput(out int wantedAmount);
-                var (matchWant, matchHave) =
-                    _calculateExactWantedAmount && hasWantedAmount
-                        ? CalculateApproximateWantedTrade(
-                            wantedAmount,
-                            give,
-                            get,
-                            availableAmount
-                        )
-                        : CalculateFillAmounts(give, get, availableAmount);
+                var (matchWant, matchHave) = _calculateExactWantedAmount
+                    ? hasWantedAmount
+                        ? RatioMath.ExactFromWant(wantedAmount, competingRatio, availableAmount)
+                        : (0, 0)
+                    : RatioMath.MaxFromHave(availableAmount, competingRatio);
 
                 if (matchHave > 0 && ImGui.SmallButton("Match"))
                 {
@@ -329,6 +328,17 @@ namespace CurrencyRatioExchange
                 else if (matchHave <= 0)
                 {
                     ImGui.TextDisabled("Match");
+                    if (
+                        _calculateExactWantedAmount
+                        && ImGui.IsItemHovered()
+                    )
+                    {
+                        ImGui.SetTooltip(
+                            hasWantedAmount
+                                ? $"{wantedAmount} cannot make a whole trade at {competingRatio.Want}:{competingRatio.Have}, or you do not have enough offered currency."
+                                : "Enter a positive exact amount first."
+                        );
+                    }
                 }
 
                 // Undercut buttons with percentages
@@ -340,17 +350,24 @@ namespace CurrencyRatioExchange
                 {
                     ImGui.SameLine();
 
-                    // Calculate undercut: reduce 'give' (what we receive) by the percentage
-                    double undercutGive = give * (1.0 - percent / 100.0);
-                    var (undercutWant, undercutHave) =
-                        _calculateExactWantedAmount && hasWantedAmount
-                            ? CalculateApproximateWantedTrade(
-                                wantedAmount,
-                                undercutGive,
-                                get,
-                                availableAmount
-                            )
-                            : CalculateFillAmounts(undercutGive, get, availableAmount);
+                    // Improve the competing buy order by wanting less for the same amount
+                    // offered. Scale with integers so the resulting ratio remains exact.
+                    bool hasUndercutRatio = RatioMath.TryUndercutWant(
+                        competingRatio,
+                        percent,
+                        out TradeRatio undercutRatio
+                    );
+                    var (undercutWant, undercutHave) = hasUndercutRatio
+                        ? _calculateExactWantedAmount
+                            ? hasWantedAmount
+                                ? RatioMath.ExactFromWant(
+                                    wantedAmount,
+                                    undercutRatio,
+                                    availableAmount
+                                )
+                                : (0, 0)
+                            : RatioMath.MaxFromHave(availableAmount, undercutRatio)
+                        : (0, 0);
 
                     if (undercutHave > 0 && ImGui.SmallButton($"{percent}%"))
                     {
@@ -359,6 +376,17 @@ namespace CurrencyRatioExchange
                     else if (undercutHave <= 0)
                     {
                         ImGui.TextDisabled($"{percent}%");
+                        if (
+                            _calculateExactWantedAmount
+                            && ImGui.IsItemHovered()
+                        )
+                        {
+                            ImGui.SetTooltip(
+                                hasWantedAmount
+                                    ? $"{wantedAmount} cannot make a whole trade at this adjusted ratio, or you do not have enough offered currency."
+                                    : "Enter a positive exact amount first."
+                            );
+                        }
                     }
                 }
 
@@ -448,71 +476,64 @@ namespace CurrencyRatioExchange
                 if (offeredItemType == null)
                     return 0;
 
-                string targetBaseName = offeredItemType.BaseName;
-                if (string.IsNullOrEmpty(targetBaseName))
+                string targetMetadata = offeredItemType.Metadata;
+                if (string.IsNullOrEmpty(targetMetadata))
                     return 0;
 
-                int amount = 0;
+                var serverData = GameController.IngameState?.Data?.ServerData;
+                var playerInventories = serverData?.PlayerInventories;
+                if (playerInventories == null)
+                    return 0;
 
-                var mainInv = GameController
-                    .IngameState
-                    .Data
-                    .ServerData
-                    .PlayerInventories
+                var mainInv = playerInventories
                     .FirstOrDefault(x => x?.Inventory?.InventType == InventoryTypeE.MainInventory);
+                int inventoryAmount = CountMatchingItems(
+                    mainInv?.Inventory?.Items,
+                    targetMetadata
+                );
 
-                var inventory = mainInv?.Inventory;
-                if (inventory?.Items == null)
-                    return 0;
-
-                foreach (var item in inventory.Items)
+                int serverStashAmount = 0;
+                int visibleStashAmount = 0;
+                if (Settings.IncludeStash.Value)
                 {
-                    if (item == null)
-                        continue;
-
-                    var baseItemType = GameController.Files.BaseItemTypes.Translate(
-                        item.Metadata
-                    );
-                    if (baseItemType?.BaseName == targetBaseName)
+                    foreach (var holder in playerInventories)
                     {
-                        var stackComp = item.GetComponent<Stack>();
-                        amount += stackComp?.Size ?? 1;
+                        var stashInventory = holder?.Inventory;
+                        if (stashInventory?.InventSlot != InventorySlotE.StashInventoryId)
+                            continue;
+
+                        serverStashAmount += CountMatchingItems(
+                            stashInventory.Items,
+                            targetMetadata
+                        );
                     }
-                }
 
-                // Also check visible stash tab if enabled
-                if (Settings.IncludeStash)
-                {
-                    try
+                    // Older/unloaded stash layouts may not expose a server inventory. Keep
+                    // the visible tab as a fallback, but never add both representations.
+                    if (serverStashAmount <= 0)
                     {
-                        var stashElement = GameController.IngameState?.IngameUi?.StashElement;
-                        var visibleStash = stashElement?.VisibleStash;
-                        var stashItems = visibleStash?.VisibleInventoryItems;
-                        if (stashItems != null)
+                        var visibleItems = GameController
+                            .IngameState
+                            ?.IngameUi
+                            ?.StashElement
+                            ?.VisibleStash
+                            ?.VisibleInventoryItems;
+                        if (visibleItems != null)
                         {
-                            foreach (var item in stashItems)
-                            {
-                                if (item?.Item == null)
-                                    continue;
-
-                                var baseItemType = GameController.Files.BaseItemTypes.Translate(
-                                    item.Item.Metadata
-                                );
-                                if (baseItemType?.BaseName == targetBaseName)
-                                {
-                                    var stackComp = item.Item.GetComponent<Stack>();
-                                    amount += stackComp?.Size ?? 1;
-                                }
-                            }
+                            visibleStashAmount = CountMatchingItems(
+                                visibleItems.Select(x => x?.Item),
+                                targetMetadata
+                            );
                         }
                     }
-                    catch
-                    {
-                        // Stash not available, just use inventory amount
-                    }
                 }
 
-                return amount;
+                return CurrencyAmountMath.Combine(
+                    inventoryAmount,
+                    serverStashAmount,
+                    visibleStashAmount,
+                    Settings.IncludeStash.Value
+                );
             }
             catch
             {
@@ -520,60 +541,31 @@ namespace CurrencyRatioExchange
             }
         }
 
-        private (int want, int have) CalculateFillAmounts(
-            double wantPerUnit,
-            double havePerUnit,
-            int availableAmount
+        private static int CountMatchingItems(
+            IEnumerable<Entity> items,
+            string targetMetadata
         )
         {
-            if (availableAmount <= 0 || wantPerUnit <= 0 || havePerUnit <= 0)
-                return (0, 0);
+            if (items == null || string.IsNullOrEmpty(targetMetadata))
+                return 0;
 
-            // Called with (give, get, availableAmount) from the stock item:
-            // - wantPerUnit = stock.Give = what WE receive per ratio unit
-            // - havePerUnit = stock.Get = what WE offer per ratio unit
-            //
-            // We want to maximize based on OUR available stock while maintaining the ratio.
-            // Use the ratio as a decimal and find the largest 'have' value where 'want' is whole.
-
-            double ratio = wantPerUnit / havePerUnit;
-
-            // Start from max available and find largest 'have' that produces whole 'want'
-            for (int have = availableAmount; have > 0; have--)
+            long amount = 0;
+            foreach (var item in items)
             {
-                double wantExact = have * ratio;
-                int wantRounded = (int)Math.Round(wantExact);
+                if (item?.Metadata != targetMetadata)
+                    continue;
 
-                // Check if it's effectively a whole number
-                if (wantRounded > 0 && Math.Abs(wantExact - wantRounded) < 0.001)
-                {
-                    return (wantRounded, have);
-                }
+                amount += item.GetComponent<Stack>()?.Size ?? 1;
+                if (amount >= int.MaxValue)
+                    return int.MaxValue;
             }
 
-            return (0, 0);
+            return (int)amount;
         }
 
         private bool TryGetWantedAmountInput(out int wantedAmount)
         {
             return int.TryParse(_amountInput, out wantedAmount) && wantedAmount > 0;
-        }
-
-        private (int want, int have) CalculateApproximateWantedTrade(
-            int wantedAmount,
-            double wantPerUnit,
-            double havePerUnit,
-            int availableAmount
-        )
-        {
-            if (wantedAmount <= 0 || wantPerUnit <= 0 || havePerUnit <= 0 || availableAmount <= 0)
-                return (0, 0);
-
-            int haveRoundedUp = (int)Math.Ceiling(wantedAmount * havePerUnit / wantPerUnit);
-            if (haveRoundedUp <= 0 || haveRoundedUp > availableAmount)
-                return (0, 0);
-
-            return (wantedAmount, haveRoundedUp);
         }
 
         private void QueueQuickFill(int want, int have)
@@ -905,25 +897,15 @@ namespace CurrencyRatioExchange
             }
 
             // Parse ratio (Want:Have format)
-            var ratioParts = ParseRatio(_ratioInput);
-            if (ratioParts == null)
+            if (!RatioMath.TryParse(_ratioInput, out TradeRatio ratio))
             {
                 _errorMessage = "Error parsing ratio. Use format like 1:3 or 2:5";
                 return;
             }
 
-            double wantPart = ratioParts.Value.want;
-            double havePart = ratioParts.Value.have;
-
-            if (wantPart <= 0 || havePart <= 0)
-            {
-                _errorMessage = "Ratio values must be positive";
-                return;
-            }
-
             var result = _calculateExactWantedAmount
-                ? CalculateExactWantedTrade(amount, wantPart, havePart)
-                : CalculateMaxTrade(amount, wantPart / havePart);
+                ? RatioMath.ExactFromWant(amount, ratio)
+                : RatioMath.MaxFromHave(amount, ratio);
 
             if (result.want > 0 && result.have > 0)
             {
@@ -933,106 +915,10 @@ namespace CurrencyRatioExchange
             }
             else
             {
-                _errorMessage = "No valid trade possible";
+                _errorMessage = _calculateExactWantedAmount
+                    ? $"{amount} cannot make a whole trade at {ratio.Want}:{ratio.Have}. The wanted amount must be a multiple of {ratio.Want}."
+                    : $"No whole trade fits. This ratio requires at least {ratio.Have} offered currency.";
             }
-        }
-
-        private (double want, double have)? ParseRatio(string ratioStr)
-        {
-            if (string.IsNullOrWhiteSpace(ratioStr))
-                return null;
-
-            try
-            {
-                ratioStr = ratioStr.Trim();
-
-                // Check for colon separator (Want:Have format)
-                if (ratioStr.Contains(':'))
-                {
-                    var parts = ratioStr.Split(':');
-                    if (parts.Length != 2)
-                        return null;
-
-                    if (
-                        double.TryParse(parts[0].Trim(), out double want)
-                        && double.TryParse(parts[1].Trim(), out double have)
-                    )
-                    {
-                        return (want, have);
-                    }
-                }
-                else
-                {
-                    // Try to parse as single expression (e.g., "1.5" or "3/2")
-                    // Check if it contains only valid characters for math expressions
-                    if (
-                        !System.Text.RegularExpressions.Regex.IsMatch(
-                            ratioStr,
-                            @"^[\d\s.\/+\-*()]+$"
-                        )
-                    )
-                    {
-                        return null;
-                    }
-
-                    // Use DataTable to evaluate the expression
-                    var table = new DataTable();
-                    var result = table.Compute(ratioStr, null);
-
-                    if (result is decimal || result is double || result is int)
-                    {
-                        double ratio = Convert.ToDouble(result);
-                        if (double.IsFinite(ratio) && ratio > 0)
-                        {
-                            // Convert single ratio to Want:Have format (1:ratio)
-                            return (1, ratio);
-                        }
-                    }
-                }
-
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private (int want, int have) CalculateMaxTrade(int totalAmount, double ratio)
-        {
-            // ratio = want / have
-            // We need to find the largest 'have' value where (have * ratio) is a whole number
-
-            for (int have = totalAmount; have > 0; have--)
-            {
-                double want = have * ratio;
-
-                // Check if want is effectively a whole number (accounting for floating point precision)
-                if (Math.Abs(want - Math.Round(want)) < 0.000001)
-                {
-                    int wantRounded = (int)Math.Round(want);
-
-                    if (wantRounded > 0)
-                    {
-                        return (want: wantRounded, have: have);
-                    }
-                }
-            }
-
-            return (want: 0, have: 0);
-        }
-
-        private (int want, int have) CalculateExactWantedTrade(
-            int wantedAmount,
-            double wantPart,
-            double havePart
-        )
-        {
-            int haveRoundedUp = (int)Math.Ceiling(wantedAmount * havePart / wantPart);
-            if (haveRoundedUp > 0)
-                return (want: wantedAmount, have: haveRoundedUp);
-
-            return (want: 0, have: 0);
         }
 
     }

@@ -14,6 +14,7 @@
     <ExileCorePath Condition="'$(exapiPackage)' != ''">$(exapiPackage)</ExileCorePath>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="Tests\**\*.cs" />
     <Reference Include="ExileCore">
       <HintPath>$(ExileCorePath)\ExileCore.dll</HintPath>
       <Private>False</Private>
